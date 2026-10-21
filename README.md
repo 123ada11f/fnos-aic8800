@@ -71,7 +71,7 @@ CDB: 16 字节，byte0 = 0xFD，byte15 = 子命令，其余全 0
 ## 3. 安装
 
 ```bash
-git clone <本仓库地址>
+git clone https://github.com/123ada11f/fnos-aic8800.git
 cd fnos-aic8800
 sudo bash install.sh
 sudo reboot
