@@ -1,0 +1,17 @@
+[Unit]
+Description=AIC8800 USB WiFi dongle mode switch (1111:1111 -> a69c:8d81)
+# Run early, right after udev has settled the USB tree.
+After=systemd-udev-trigger.service systemd-udevd.service
+Wants=systemd-udev-trigger.service
+DefaultDependencies=no
+Before=network-pre.target bluetooth.service NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aic8800-switch
+RemainAfterExit=yes
+# The dongle needs a moment to re-enumerate; give the script room.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,132 @@
+#!/bin/bash
+# AIC8800 USB WiFi6 dongle (88M80 / LGX WIFI6)
+#
+# The dongle normally enumerates as a69c:8d80 (load-firmware) and then
+# a69c:8d81 (WiFi + Bluetooth).  Some units instead come up in a fallback
+# USB-mass-storage mode with the generic id 1111:1111, exposing a small
+# read-only "WIFI6" volume that only contains the Windows installer.
+#
+# The vendor's own tooling flips it out of that mode with a vendor specific
+# SCSI command: a 16 byte CDB with byte0 = 0xFD and byte15 = 0xF2, plus a
+# 16 byte zero payload.  (0xF3 returns the device info string "88M80 / DISK".)
+# After the switch the dongle re-enumerates as a69c:8d80 and the aic8800
+# kernel drivers take over normally.
+set -u
+
+log() { echo "aic8800-switch: $*"; }
+
+# Find the /dev/sg node that belongs to the 1111:1111 dongle by walking up
+# from each scsi_generic device to the usb_device that owns it.
+find_sg() {
+  local g dev p vid pid n
+  for g in /sys/class/scsi_generic/sg*; do
+    [ -e "$g" ] || continue
+    dev=$(readlink -f "$g/device" 2>/dev/null) || continue
+    p="$dev"
+    while [ -n "$p" ] && [ "$p" != "/" ]; do
+      if [ -f "$p/idVendor" ] && [ -f "$p/idProduct" ]; then
+        vid=$(cat "$p/idVendor" 2>/dev/null)
+        pid=$(cat "$p/idProduct" 2>/dev/null)
+        if [ "$vid" = "1111" ] && [ "$pid" = "1111" ]; then
+          n=$(basename "$g"); n=${n#sg}
+          [ -e "/dev/sg$n" ] && { echo "/dev/sg$n"; return 0; }
+        fi
+        break
+      fi
+      p=$(dirname "$p")
+    done
+  done
+  return 1
+}
+
+stuck=0
+for d in /sys/bus/usb/devices/*; do
+  [ -f "$d/idVendor" ] || continue
+  if [ "$(cat "$d/idVendor" 2>/dev/null)" = "1111" ] && \
+     [ "$(cat "$d/idProduct" 2>/dev/null)" = "1111" ]; then
+    stuck=1; break
+  fi
+done
+
+if [ "$stuck" = "0" ]; then
+  log "no 1111:1111 dongle present, nothing to do"
+  exit 0
+fi
+
+log "dongle is in mass-storage mode, switching to WiFi mode"
+
+# The SCSI generic node can appear a moment after the USB device itself, so poll.
+sg=""
+for _ in $(seq 1 60); do
+  sg=$(find_sg) && [ -n "$sg" ] && break
+  sleep 0.5
+done
+if [ -z "$sg" ]; then
+  log "timed out waiting for the SCSI generic node"
+  exit 1
+fi
+log "using $sg"
+
+python3 - "$sg" <<'PY'
+import os, sys, fcntl, ctypes
+SGIO = 0x2285
+
+class Hdr(ctypes.Structure):
+    _fields_ = [
+        ("interface_id", ctypes.c_int), ("dxfer_direction", ctypes.c_int),
+        ("cmd_len", ctypes.c_ubyte), ("mx_sb_len", ctypes.c_ubyte),
+        ("iovec_count", ctypes.c_ushort), ("dxfer_len", ctypes.c_uint),
+        ("dxferp", ctypes.c_void_p), ("cmdp", ctypes.c_void_p),
+        ("sbp", ctypes.c_void_p), ("timeout", ctypes.c_uint),
+        ("flags", ctypes.c_uint), ("pack_id", ctypes.c_int),
+        ("usr_ptr", ctypes.c_void_p), ("status", ctypes.c_ubyte),
+        ("masked_status", ctypes.c_ubyte), ("msg_status", ctypes.c_ubyte),
+        ("sb_len_wr", ctypes.c_ubyte), ("host_status", ctypes.c_ushort),
+        ("driver_status", ctypes.c_ushort), ("resid", ctypes.c_int),
+        ("duration", ctypes.c_uint), ("info", ctypes.c_uint),
+    ]
+
+def run(fd, cdb, din_len, dirn, dout=b""):
+    h = Hdr()
+    h.interface_id = ord('S'); h.dxfer_direction = dirn
+    h.cmd_len = len(cdb); h.mx_sb_len = 32; h.timeout = 5000
+    cb = ctypes.create_string_buffer(bytes(cdb), len(cdb))
+    h.cmdp = ctypes.cast(cb, ctypes.c_void_p)
+    sb = ctypes.create_string_buffer(32)
+    h.sbp = ctypes.cast(sb, ctypes.c_void_p)
+    if dirn == -1:
+        db = ctypes.create_string_buffer(dout, max(len(dout), 1)); h.dxfer_len = len(dout)
+    else:
+        db = ctypes.create_string_buffer(max(din_len, 1)); h.dxfer_len = din_len
+    h.dxferp = ctypes.cast(db, ctypes.c_void_p)
+    try:
+        fcntl.ioctl(fd, SGIO, h)
+    except OSError as e:
+        return ("ERR", e.errno, b"")
+    return (h.status, h.host_status, bytes(db.raw[:din_len]) if (dirn != -1 and din_len) else b"")
+
+def cdb(sub):
+    c = bytearray(16); c[0] = 0xFD; c[15] = sub
+    return c
+
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NONBLOCK)
+try:
+    st, hs, data = run(fd, cdb(0xF3), 64, -3)
+    print("aic8800-switch: device says %r (status=%s)" % (data.split(b"\0")[0], st))
+finally:
+    pass
+st, hs, _ = run(fd, cdb(0xF2), 0, -1, bytes(16))
+print("aic8800-switch: switch command status=%s host=%s" % (st, hs))
+os.close(fd)
+PY
+
+# Wait for re-enumeration to a69c:8d80 / a69c:8d81.
+for _ in $(seq 1 20); do
+  sleep 0.5
+  if lsusb 2>/dev/null | grep -qiE "a69c:8d8[01]"; then
+    log "dongle re-enumerated as AIC WiFi device"
+    exit 0
+  fi
+done
+log "switch command sent, but the dongle did not re-enumerate (it may need a replug)"
+exit 1
